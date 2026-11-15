@@ -122,6 +122,8 @@ def collect_status():
         "loaded_rows": int(meta.get("loaded_rows") or 0),
         "applied_txns": int(meta.get("applied_txns") or 0),
         "applied_changes": int(meta.get("applied_changes") or 0),
+        "magnitude_anomalies": int(meta.get("magnitude_anomalies") or 0),
+        "anomaly_rows": store.read("SELECT count(*) FROM magnitude_anomalies")[0][0],
         "last_applied_lsn": meta.get("last_applied_lsn") or "",
         "consistent_point": meta.get("consistent_point") or "",
         "target_lsn": meta.get("target_lsn") or "",
@@ -183,6 +185,10 @@ def dashboard():
         ("源库当前行数（实时）", st["source_rows"] if st["source_ok"] else "源库不可用"),
         ("已应用源事务数", st["applied_txns"]),
         ("已应用行变更数", st["applied_changes"]),
+        (
+            "本轮震级突变记录数",
+            f"{st['anomaly_rows']} 条" if st["serving"] else "（就绪后开放查阅）",
+        ),
         ("镜像已保存位置 last_applied_lsn", f"<span class='mono'>{esc(st['last_applied_lsn'] or '—')}</span>"),
     ]
     if st["slot"]:
@@ -242,9 +248,10 @@ def dashboard():
             )
         actions.append("<a class='btn' href='/events'>查询震例</a>")
         actions.append("<a class='btn' href='/events.csv'>下载当前目录 CSV</a>")
+        actions.append("<a class='btn' href='/anomalies'>震级突变记录</a>")
         actions.append("<a class='btn' href='/verify'>一致性校验</a>")
     else:
-        actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载与一致性校验</span>")
+        actions.append("<span class='muted'>镜像就绪后开放查询、CSV 下载、震级突变记录与一致性校验</span>")
 
     log_rows = "".join(
         f"<tr><td>{esc(ts)}</td><td>{esc(msg)}</td></tr>" for ts, msg in st["log"]
@@ -433,6 +440,109 @@ def events_csv(request: Request):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=quake_catalog.csv"},
     )
+
+
+# ---------------- 路由：震级突变记录 ----------------
+
+ANOMALY_PAGE_SIZE = 50
+
+
+def build_anomaly_where(f):
+    where, params = [], []
+    if f["q"]:
+        where.append("event_id LIKE ?")
+        params.append(f["q"] + "%")
+    if f["min_delta"]:
+        where.append("delta >= ?")
+        params.append(float(f["min_delta"]))
+    if f["lsn"]:
+        where.append("lsn = ?")
+        params.append(f["lsn"])
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+@app.get("/anomalies", response_class=HTMLResponse)
+def anomalies(request: Request):
+    """震级突变记录：只展示本轮镜像建立以来流式续采中留存的记录。"""
+    if not serving():
+        return not_ready()
+
+    f = {
+        k: (request.query_params.get(k) or "").strip()
+        for k in ("q", "min_delta", "lsn")
+    }
+    try:
+        page_no = max(1, int(request.query_params.get("page", "1")))
+        where_sql, params = build_anomaly_where(f)
+    except ValueError:
+        return HTMLResponse(
+            page("参数错误", "<div class='card'><p>筛选参数格式不正确。</p>"
+                 "<p><a class='btn' href='/anomalies'>返回突变记录</a></p></div>"),
+            status_code=400,
+        )
+
+    txn = store.read_txn()             # 计数与取页读同一已提交状态
+    try:
+        total = txn.execute(
+            f"SELECT count(*) FROM magnitude_anomalies{where_sql}", params
+        ).fetchone()[0]
+        pages = max(1, (total + ANOMALY_PAGE_SIZE - 1) // ANOMALY_PAGE_SIZE)
+        page_no = min(page_no, pages)
+        rows = txn.execute(
+            "SELECT lsn, xid, event_id, old_magnitude, new_magnitude, delta, detected_at "
+            f"FROM magnitude_anomalies{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [ANOMALY_PAGE_SIZE, (page_no - 1) * ANOMALY_PAGE_SIZE],
+        ).fetchall()
+    finally:
+        txn.close()
+
+    body_rows = "".join(
+        f"<tr><td class='mono'>{esc(r[0])}</td>"
+        f"<td class='mono'>{esc(r[1] or '—')}</td>"
+        f"<td class='mono'><a href='/events?q={urllib.parse.quote(str(r[2]))}'>"
+        f"{esc(r[2])}</a></td>"
+        f"<td>{r[3]:.1f}</td><td><b>{r[4]:.1f}</b></td>"
+        f"<td>±{r[5]:.1f}</td><td class='mono'>{esc(r[6])}</td></tr>"
+        for r in rows
+    ) or "<tr><td colspan='7' class='muted'>本轮暂无震级突变记录</td></tr>"
+
+    inputs = (
+        f"<form method='get' action='/anomalies'>"
+        f"<label>震例号前缀</label><input name='q' value='{esc(f['q'])}' size='10'>"
+        f"<label>最小差值</label><input name='min_delta' value='{esc(f['min_delta'])}' size='4'"
+        f" placeholder='2.0'>"
+        f"<label>事务位置</label><input name='lsn' value='{esc(f['lsn'])}' size='12'"
+        f" placeholder='0/1A2B3C4D'>"
+        f"<button type='submit'>筛选</button>"
+        f"<a class='btn' href='/anomalies'>清除</a></form>"
+    )
+
+    qs = {k: v for k, v in f.items() if v}
+    prev_q = urllib.parse.urlencode({**qs, "page": page_no - 1})
+    next_q = urllib.parse.urlencode({**qs, "page": page_no + 1})
+    pager = []
+    if page_no > 1:
+        pager.append(f"<a class='btn' href='/anomalies?{prev_q}'>上一页</a>")
+    pager.append(
+        f"<span class='muted'>第 {page_no} / {pages} 页 · 共 {total} 条"
+        f"（同一已提交状态；仅本轮记录）</span>"
+    )
+    if page_no < pages:
+        pager.append(f"<a class='btn' href='/anomalies?{next_q}'>下一页</a>")
+    pager.append("<a class='btn' href='/'>返回采集状态</a>")
+
+    body = (
+        "<div class='card'><h2>震级突变记录</h2>"
+        "<p class='muted'>镜像续采每笔源事务时，对同一震例比较事务前后的震级；"
+        "差值达到 2.0 即留存，供复核人员查阅。同一笔事务内对同一震例的反复更正"
+        "只按最终值记录一次；初次装载与重建前的记录不计入本轮。</p>"
+        f"{inputs}</div>"
+        "<div class='card'><table><tr><th>事务位置 LSN</th><th>事务号</th>"
+        "<th>震例号</th><th>旧震级</th><th>新震级</th><th>差值</th>"
+        f"<th>记录时间</th></tr>{body_rows}</table>"
+        f"<p style='margin-top:12px'>{''.join(pager)}</p></div>"
+    )
+    return page("震级突变记录", body)
 
 
 # ---------------- 路由：一致性校验 ----------------

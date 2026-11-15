@@ -31,6 +31,24 @@ CREATE TABLE IF NOT EXISTS event_log (
     ts  TEXT NOT NULL,
     msg TEXT NOT NULL
 );
+
+-- 震级突变记录（仅记录本轮镜像建立以来、流式续采中发现的突变）。
+-- UNIQUE(lsn, event_id)：崩溃后源库重发同一事务时幂等，不重复记录。
+CREATE TABLE IF NOT EXISTS magnitude_anomalies (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    lsn           TEXT NOT NULL,        -- 源事务提交位置（事务位置）
+    xid           TEXT,                 -- 源事务号（便于复核）
+    event_id      TEXT NOT NULL,        -- 震例号
+    old_magnitude REAL NOT NULL,        -- 事务前震级
+    new_magnitude REAL NOT NULL,        -- 事务后（最终）震级
+    delta         REAL NOT NULL,        -- |新 - 旧|
+    detected_at   TEXT NOT NULL,
+    UNIQUE (lsn, event_id)
+);
+CREATE INDEX IF NOT EXISTS magnitude_anomalies_event_idx
+    ON magnitude_anomalies(event_id);
+CREATE INDEX IF NOT EXISTS magnitude_anomalies_lsn_idx
+    ON magnitude_anomalies(lsn);
 """
 
 LOG_KEEP = 100

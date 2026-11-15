@@ -52,6 +52,10 @@ docker compose up --build
 | 未建完则重做且不供数 | 重启时状态为 `loading/catchup`：丢弃半成品重新建立；就绪前查询/CSV 一律 503 |
 | 每次取数只读同一已提交状态 | 每个网页请求只开一个 SQLite 只读事务，计数、取页、整个 CSV 流都在同一快照里 |
 | 只处理行变更 | 仅应用 insert/update/delete；truncate 等记录并忽略 |
+| 震级突变留存复核 | 流式续采每笔源事务，对同一震例比较事务前后震级，差值达到 2.0 即记录 |
+| 突变记录与镜像/位置同生共死 | 比较、异常记录、行变更、`last_applied_lsn` 同一 SQLite 事务；提交后才确认源库 |
+| 重发不重复记录 / 重建不串轮 | `UNIQUE(lsn, event_id)` + 幂等忽略；重建时清空上一轮异常记录 |
+| 初次装载不记异常 | 只有 `catchup`/`done` 的流式事务参与比较；装载前的修订不产生记录 |
 
 ## 演示场景
 
@@ -110,6 +114,30 @@ docker compose restart app
 事件日志显示“镜像已就绪，从复制槽的已确认位置续采”——**不重新装载**，
 直接从上次确认位置继续，重启期间的源库变更全部补齐。
 
+### 6. 震级突变记录（复核用）
+
+镜像就绪后点击状态页「震级突变记录」，或直接打开 `http://localhost:8000/anomalies`。
+续采每笔源事务时，对同一震例比较**事务前**（上一笔已提交事务之后）与**事务后**
+（本笔事务应用完的最终值）震级，差值达到 2.0 即留存震例号、旧/新震级和事务位置 LSN：
+
+```bash
+# 制造一次突变：震级一次跳 6.0
+docker compose exec db psql -U postgres -d quakes -c \
+  "UPDATE seismic_events SET magnitude=9.5 WHERE event_id='EQH-000010';"
+# 再改回原值：又是一次突变，同样留档 —— 即使后来被改回也要留给复核人员
+docker compose exec db psql -U postgres -d quakes -c \
+  "UPDATE seismic_events SET magnitude=3.5 WHERE event_id='EQH-000010';"
+```
+
+规则说明：
+
+- 一笔事务里对同一震例反复更正（如 4.5 → 7.0 → 9.0）只按**最终值**记录一次；
+- 事务后才新增（事务前不存在）或事务中最终删除的震例不记录；
+- 初次装载不记异常；「重新建立镜像」后只查本轮记录；
+- 崩溃后源库重发同一事务不会重复记录（`UNIQUE(lsn, event_id)` 幂等）；
+- 记录与镜像行变更、续采位置在同一 SQLite 事务提交，写失败则整笔回滚、不确认源库；
+- 网页仅在镜像就绪后供数，未就绪返回 503。
+
 ## 网页与接口
 
 | 路径 | 说明 |
@@ -120,6 +148,7 @@ docker compose restart app
 | `POST /demo/crash-after-save` | 武装“保存后未确认就崩溃”演示 |
 | `GET /events` | 查询震例：震例号前缀、发震时刻区间、最小震级、经纬度范围、分页 |
 | `GET /events.csv` | 下载当前目录 CSV（支持同样筛选；整个文件出自同一已提交状态） |
+| `GET /anomalies` | 震级突变记录：按震例号前缀、最小差值、事务位置筛选，分页查看本轮记录 |
 | `GET /verify` | 源库 vs 镜像全量比对（行数 + SHA-256 + 差异样例） |
 | `GET /api/status` | 上述状态的 JSON 版 |
 | `GET /healthz` | 存活探针 |
@@ -140,13 +169,13 @@ docker compose restart app
 | 初始装载中 | 状态 `loading` → 重做装载，就绪前不供数 |
 | 追平中 | 状态 `catchup` → 重做装载（快照已失效，必须重来），就绪前不供数 |
 | 已就绪 | 状态 `done` → 从槽位已确认位置续采，不重新装载 |
-| 保存后未确认就崩溃 | 源库重发未确认事务，镜像幂等重放，不重不漏 |
+| 保存后未确认就崩溃 | 源库重发未确认事务，镜像幂等重放，不重不漏（突变记录同样不重复） |
 | 复制槽被删（源库重置） | 自动转为重新建立镜像 |
 | 卷被清空（`down -v`） | 一切从零开始，等待点击「开始建立镜像」 |
 
 ## 本地测试
 
-核心逻辑（SQLite 落库、wal2json 事务应用、LSN 换算、快照读一致性）有单元测试，
+核心逻辑（SQLite 落库、wal2json 事务应用、LSN 换算、快照读一致性、震级突变留存）有单元测试，
 无需 Docker：
 
 ```bash
@@ -160,9 +189,9 @@ compose.yaml            # 一键启动：db + app + simulator
 db/                     # PostgreSQL 16 + wal2json，含 3 万条历史震例的初始化脚本
 app/                    # FastAPI 网页 + 逻辑复制采集线程 + SQLite 镜像
   replicator.py         #   状态机：idle→loading→catchup→done，快照装载与流式续采
-  store.py              #   SQLite 层：数据与续采位置同事务持久化
-  changes.py            #   wal2json 行变更 -> 幂等 upsert/delete
-  main.py               #   网页：状态 / 查询 / CSV / 校验
+  store.py              #   SQLite 层：数据、续采位置与震级突变记录同事务持久化
+  changes.py            #   wal2json 行变更 -> 幂等 upsert/delete；震级突变比较与留存
+  main.py               #   网页：状态 / 查询 / CSV / 突变记录 / 校验
 simulator/              # 源库扰动器：持续新增/更正/删除
 tests/test_core.py      # 核心逻辑单元测试
 ```

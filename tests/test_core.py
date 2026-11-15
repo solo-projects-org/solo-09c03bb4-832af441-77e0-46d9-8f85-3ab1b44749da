@@ -16,7 +16,7 @@ from decimal import Decimal
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
 from canonical import canonical_line, norm_ts            # noqa: E402
-from changes import apply_transaction                    # noqa: E402
+from changes import apply_transaction, record_magnitude_anomalies  # noqa: E402
 from lsnutil import int_to_lsn, lsn_to_int               # noqa: E402
 from store import Store                                  # noqa: E402
 
@@ -153,6 +153,150 @@ class ApplyTest(StoreTestBase):
             apply_transaction(cur, {"change": [change("insert", f"E{i:02d}") for i in range(20)]})
             Store.set_meta(cur, "last_applied_lsn", "0/10")
         self.assertEqual(len(self.rows()), 20)
+
+
+class AnomalyTest(StoreTestBase):
+    def apply_with_anomalies(self, payload, lsn, xid=1):
+        """模拟 replicator 的流式续采：比较、记录、行变更、位置同一事务。"""
+        with self.store.write_txn() as cur:
+            recorded = record_magnitude_anomalies(cur, payload, lsn, xid)
+            apply_transaction(cur, payload)
+            Store.set_meta(cur, "last_applied_lsn", lsn)
+        return recorded
+
+    def anomalies(self):
+        return self.store.read(
+            "SELECT lsn, event_id, old_magnitude, new_magnitude, delta"
+            " FROM magnitude_anomalies ORDER BY id"
+        )
+
+    def seed(self, mag=4.5):
+        self.apply_with_anomalies({"change": [change("insert", "A", mag=mag)]}, "0/10")
+
+    def test_records_when_delta_reaches_threshold(self):
+        self.seed(4.5)
+        rec = self.apply_with_anomalies({"change": [change("update", "A", mag=6.5)]}, "0/20")
+        self.assertEqual(rec, [{"event_id": "A", "old_magnitude": 4.5,
+                                "new_magnitude": 6.5, "delta": 2.0}])
+        self.assertEqual(self.anomalies(), [("0/20", "A", 4.5, 6.5, 2.0)])
+
+    def test_below_threshold_not_recorded(self):
+        self.seed(4.5)
+        rec = self.apply_with_anomalies({"change": [change("update", "A", mag=6.4)]}, "0/20")
+        self.assertEqual(rec, [])
+        self.assertEqual(self.anomalies(), [])
+
+    def test_repeated_correction_in_one_txn_recorded_once_with_final_value(self):
+        """一笔事务先 4.5->7.0 再 7.0->4.5：只按最终值 4.5 与事务前 4.5 比，不记录。"""
+        self.seed(4.5)
+        rec = self.apply_with_anomalies(
+            {"change": [change("update", "A", mag=7.0), change("update", "A", mag=4.5)]},
+            "0/20",
+        )
+        self.assertEqual(rec, [])
+        self.assertEqual(self.anomalies(), [])
+
+    def test_repeated_correction_recorded_once(self):
+        """4.5 -> 7.0 -> 8.0：只记一条，旧值取事务前、新值取最终值。"""
+        self.seed(4.5)
+        self.apply_with_anomalies(
+            {"change": [change("update", "A", mag=7.0), change("update", "A", mag=8.0)]},
+            "0/20",
+        )
+        self.assertEqual(self.anomalies(), [("0/20", "A", 4.5, 8.0, 3.5)])
+
+    def test_primary_key_rename_not_compared(self):
+        """震例号被改不视为“同一震例号”的震级突变。"""
+        self.seed(4.5)
+        rec = self.apply_with_anomalies(
+            {"change": [change_rename("A", "B")]}, "0/20"
+        )
+        self.assertEqual(rec, [])
+        self.assertEqual(self.anomalies(), [])
+
+    def test_insert_and_delete_not_recorded(self):
+        self.apply_with_anomalies({"change": [change("insert", "NEW", mag=9.0)]}, "0/10")
+        self.seed(4.5)
+        # 同一事务里 4.5 -> 8.0 然后又删掉：最终没有该震例，不记
+        self.apply_with_anomalies(
+            {"change": [change("update", "A", mag=8.0), change("delete", "A")]}, "0/20"
+        )
+        self.assertEqual(self.anomalies(), [])
+
+    def test_replay_does_not_duplicate(self):
+        """保存后未确认 -> 源库重发同一事务：异常记录不重复。"""
+        self.seed(4.5)
+        payload = {"change": [change("update", "A", mag=7.5)]}
+        self.apply_with_anomalies(payload, "0/20", xid=7)
+        self.apply_with_anomalies(payload, "0/20", xid=7)
+        self.assertEqual(self.anomalies(), [("0/20", "A", 4.5, 7.5, 3.0)])
+
+    def test_old_value_taken_from_previous_committed_state(self):
+        """事务前值 = 上一笔已提交事务后的值，而不是本事务中途的值。"""
+        self.seed(4.5)
+        self.apply_with_anomalies({"change": [change("update", "A", mag=6.0)]}, "0/20")
+        self.apply_with_anomalies({"change": [change("update", "A", mag=8.0)]}, "0/30")
+        self.assertEqual(self.anomalies(), [("0/30", "A", 6.0, 8.0, 2.0)])
+
+    def test_rollback_keeps_no_anomaly_and_no_advance(self):
+        self.seed(4.5)
+        with self.assertRaises(RuntimeError):
+            with self.store.write_txn() as cur:
+                record_magnitude_anomalies(cur, {"change": [change("update", "A", mag=8.0)]}, "0/20")
+                apply_transaction(cur, {"change": [change("update", "A", mag=8.0)]})
+                Store.set_meta(cur, "last_applied_lsn", "0/20")
+                raise RuntimeError("模拟写入失败")
+        self.assertEqual(self.anomalies(), [])
+        self.assertEqual(self.store.get_meta("last_applied_lsn"), "0/10")
+        self.assertEqual(self.rows()[0][4], 4.5)
+
+
+class ReplicatorWiringTest(StoreTestBase):
+    """regression：只有流式续采（catchup/done）才记录突变，初次装载不记。"""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import replicator  # noqa: F401  依赖 psycopg2；无此依赖时跳过
+        except ImportError:
+            self.skipTest("psycopg2 不可用，跳过 replicator 装配测试")
+        from replicator import Replicator
+        self.rep = Replicator({}, "slot", self.store)
+
+    def feed(self, state, body, lsn):
+        with self.store.write_txn() as cur:
+            Store.set_meta(cur, "load_state", state)
+            cur.execute(
+                "INSERT OR IGNORE INTO events"
+                "(event_id, origin_time, latitude, longitude, magnitude)"
+                " VALUES('A', 'T', 30.0, 100.0, 4.5)"
+            )
+            Store.set_meta(cur, "last_applied_lsn", "0/0")
+
+        import json
+        class Msg:
+            data_start = lsn_to_int(lsn)
+            payload = json.dumps(body)
+            reply_requested = False
+
+        class Cur:
+            def send_feedback(self, **kw):
+                pass
+
+        self.rep._on_message(Cur(), Msg(), None)
+
+    def test_initial_loading_does_not_record(self):
+        self.feed("loading", {"change": [change("insert", "A", mag=8.0)]}, "0/10")
+        self.assertEqual(self.store.read("SELECT count(*) FROM magnitude_anomalies")[0][0], 0)
+
+    def test_catchup_and_done_record(self):
+        for state, lsn, mag in (("catchup", "0/10", 7.0), ("done", "0/20", 9.0)):
+            self.feed(state, {"change": [change("update", "A", mag=mag)]}, lsn)
+        rows = self.store.read(
+            "SELECT lsn, event_id, old_magnitude, new_magnitude FROM magnitude_anomalies ORDER BY id"
+        )
+        self.assertEqual(rows, [("0/10", "A", 4.5, 7.0), ("0/20", "A", 7.0, 9.0)])
+        self.assertEqual(self.store.get_meta("magnitude_anomalies"), "2")
 
 
 class SnapshotReadTest(StoreTestBase):

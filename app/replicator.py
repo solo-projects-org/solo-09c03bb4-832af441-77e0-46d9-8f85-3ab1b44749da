@@ -25,7 +25,7 @@ import psycopg2
 from psycopg2.extras import LogicalReplicationConnection
 
 from canonical import norm_ts
-from changes import apply_transaction
+from changes import apply_transaction, record_magnitude_anomalies
 from lsnutil import int_to_lsn, lsn_to_int
 from store import Store, utcnow
 
@@ -103,18 +103,21 @@ class Replicator(threading.Thread):
     def _reset_for_build(self):
         with self.store.write_txn() as cur:
             cur.execute("DELETE FROM events")
+            # 重建即新一轮：上一轮的异常记录随之作废，网页只查本轮记录
+            cur.execute("DELETE FROM magnitude_anomalies")
             for key, value in (
                 ("load_state", "loading"),
                 ("loaded_rows", "0"),
                 ("applied_txns", "0"),
                 ("applied_changes", "0"),
+                ("magnitude_anomalies", "0"),
                 ("last_applied_lsn", ""),
                 ("consistent_point", ""),
                 ("target_lsn", ""),
                 ("ready_at", ""),
             ):
                 Store.set_meta(cur, key, value)
-            self.store.log("清空镜像，开始（重新）初始装载；就绪前不供数", cur)
+            self.store.log("清空镜像与上一轮异常记录，开始（重新）初始装载；就绪前不供数", cur)
 
     def _build_and_stream(self):
         rep_conn = psycopg2.connect(connection_factory=LogicalReplicationConnection, **self.pg)
@@ -222,34 +225,46 @@ class Replicator(threading.Thread):
         if msg.payload:
             payload = json.loads(msg.payload)
             lsn = msg.data_start
+            lsn_text = int_to_lsn(lsn)
+            anomaly_count = 0
             with self.store.write_txn() as cur:
+                row = cur.execute("SELECT value FROM meta WHERE key='load_state'").fetchone()
+                state = row[0] if row else ""
+                # 震级突变只在流式续采中记录；初次装载不记异常。
+                # 比较、记录、行变更、续采位置都在本事务里，提交后才会确认源库。
+                if state in ("catchup", "done"):
+                    anomalies = record_magnitude_anomalies(
+                        cur, payload, lsn_text, payload.get("xid")
+                    )
+                    anomaly_count = len(anomalies)
                 counts = apply_transaction(cur, payload)
                 n_changes = counts["insert"] + counts["update"] + counts["delete"]
                 _bump(cur, "applied_txns", 1)
                 if n_changes:
                     _bump(cur, "applied_changes", n_changes)
-                Store.set_meta(cur, "last_applied_lsn", int_to_lsn(lsn))
-                row = cur.execute("SELECT value FROM meta WHERE key='load_state'").fetchone()
-                state = row[0] if row else ""
+                if anomaly_count:
+                    _bump(cur, "magnitude_anomalies", anomaly_count)
+                Store.set_meta(cur, "last_applied_lsn", lsn_text)
                 if n_changes:
                     self.store.log(
-                        f"应用源事务 LSN={int_to_lsn(lsn)}：新增 {counts['insert']}、"
-                        f"更正 {counts['update']}、删除 {counts['delete']}",
+                        f"应用源事务 LSN={lsn_text}：新增 {counts['insert']}、"
+                        f"更正 {counts['update']}、删除 {counts['delete']}"
+                        + (f"；震级突变 {anomaly_count} 条" if anomaly_count else ""),
                         cur,
                     )
                 if state == "catchup" and target_lsn is not None and lsn >= target_lsn:
                     Store.set_meta(cur, "load_state", "done")
                     Store.set_meta(cur, "ready_at", utcnow())
-                    self.store.log(f"已追平至 {int_to_lsn(lsn)}，镜像就绪，开始供数", cur)
-            # —— 顺序保证：上面的事务提交（数据+位置已持久）后，才向源库确认 ——
+                    self.store.log(f"已追平至 {lsn_text}，镜像就绪，开始供数", cur)
+            # —— 顺序保证：上面的事务提交（数据+位置+异常记录已持久）后，才向源库确认 ——
             if self.crash_armed.is_set():
                 # 演示「保存后尚未确认就重启」：故意在 send_feedback 之前杀掉进程
                 self.crash_armed.clear()
                 self.store.log(
-                    f"演示：事务 {int_to_lsn(lsn)} 已保存但未确认，模拟进程崩溃；"
+                    f"演示：事务 {lsn_text} 已保存但未确认，模拟进程崩溃；"
                     f"重启后源库将重发该事务"
                 )
-                print(f"[replicator] crash-after-save at {int_to_lsn(lsn)}", flush=True)
+                print(f"[replicator] crash-after-save at {lsn_text}", flush=True)
                 os._exit(1)
             rep_cur.send_feedback(flush_lsn=lsn)
         else:
