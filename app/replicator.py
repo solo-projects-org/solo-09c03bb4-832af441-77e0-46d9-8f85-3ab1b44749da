@@ -103,6 +103,8 @@ class Replicator(threading.Thread):
     def _reset_for_build(self):
         with self.store.write_txn() as cur:
             cur.execute("DELETE FROM events")
+            # 只查本轮：重建时清空上一轮的震级突变记录，就绪后网页只展示本轮
+            cur.execute("DELETE FROM magnitude_anomalies")
             for key, value in (
                 ("load_state", "loading"),
                 ("loaded_rows", "0"),
@@ -223,18 +225,27 @@ class Replicator(threading.Thread):
             payload = json.loads(msg.payload)
             lsn = msg.data_start
             with self.store.write_txn() as cur:
-                counts = apply_transaction(cur, payload)
+                counts = apply_transaction(cur, payload, lsn=int_to_lsn(lsn),
+                                           xid=payload.get("xid"))
                 n_changes = counts["insert"] + counts["update"] + counts["delete"]
                 _bump(cur, "applied_txns", 1)
                 if n_changes:
                     _bump(cur, "applied_changes", n_changes)
+                if counts["anomalies"]:
+                    # 异常记录与镜像、续采位置在同一个事务里持久化；
+                    # 重放同一事务时 UNIQUE(event_id, lsn) 保证不重复记。
+                    self.store.record_anomalies(cur, counts["anomalies"])
                 Store.set_meta(cur, "last_applied_lsn", int_to_lsn(lsn))
                 row = cur.execute("SELECT value FROM meta WHERE key='load_state'").fetchone()
                 state = row[0] if row else ""
                 if n_changes:
                     self.store.log(
                         f"应用源事务 LSN={int_to_lsn(lsn)}：新增 {counts['insert']}、"
-                        f"更正 {counts['update']}、删除 {counts['delete']}",
+                        f"更正 {counts['update']}、删除 {counts['delete']}"
+                        + (
+                            f"；震级突变 {len(counts['anomalies'])} 条"
+                            if counts["anomalies"] else ""
+                        ),
                         cur,
                     )
                 if state == "catchup" and target_lsn is not None and lsn >= target_lsn:

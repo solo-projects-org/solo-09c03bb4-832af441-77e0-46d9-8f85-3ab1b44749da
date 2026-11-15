@@ -95,6 +95,29 @@ def recalibration(cur):
     return f"台网重新测定：一笔事务批量修订 {len(ids)} 条震级"
 
 
+def magnitude_jump(cur):
+    """制造一次震级骤变（|Δ| >= 2.0），用于演示镜像端震级突变留档。
+
+    每隔一段时间可能在一笔事务里先改一版、再改一版（只按最终值留档一条），
+    之后也可能被“订正”回接近原值 —— 但已留下的记录不会被撤销。
+    """
+    cur.execute("SELECT event_id, magnitude FROM seismic_events ORDER BY random() LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return "无震例可做震级突变"
+    eid, old = row[0], float(row[1])
+    delta = random.uniform(2.2, 4.0) * random.choice((-1, 1))
+    target = min(9.9, max(0.0, round(old + delta, 1)))
+    if abs(target - old) < 2.0:                     # 贴近边界时反向取
+        target = min(9.9, max(0.0, round(old - delta, 1)))
+    if random.random() < 0.5:
+        # 同一笔事务反复更正：中间值不应单独留档
+        mid = round((old + target) / 2, 1)
+        cur.execute("UPDATE seismic_events SET magnitude=%s WHERE event_id=%s", (mid, eid))
+    cur.execute("UPDATE seismic_events SET magnitude=%s WHERE event_id=%s", (target, eid))
+    return f"震级骤变（同一事务）：{eid} {old:.1f} -> {target:.1f}"
+
+
 def main():
     conn = connect()
     cur = conn.cursor()
@@ -114,7 +137,12 @@ def main():
     while True:
         i += 1
         try:
-            msg = recalibration(cur) if i % 50 == 0 else one_tick(cur)
+            if i % 50 == 0:
+                msg = recalibration(cur)
+            elif i % 12 == 0:
+                msg = magnitude_jump(cur)
+            else:
+                msg = one_tick(cur)
             conn.commit()
             print(f"[simulator] #{i} {msg}", flush=True)
         except psycopg2.Error as exc:

@@ -4,6 +4,9 @@
 之后持续接收源库的**新增、更正、删除**；初次取数不停写源库；镜像与续采位置持久保存后
 才向源库确认复制进度；重启后已建镜像续采、未建完重做且不供数。
 
+镜像续采时还负责**震级突变留档**：同一震例号在一笔源事务前后震级差达到 2.0，
+就留下震例号、旧/新震级与事务位置供质检复核 —— 即使震级后来被改回，记录仍在。
+
 ## 组成
 
 ```
@@ -24,9 +27,9 @@
 - **db**：PostgreSQL 16 + wal2json 插件，`wal_level=logical`；初始化脚本写入
   **30000 条历史震例**（震例号 / UTC 发震时刻 / 纬度 / 经度 / 震级）。
 - **app**：FastAPI + psycopg2 + SQLite。后台线程做初始装载与逻辑复制续采，
-  网页提供采集状态、震例查询、当前目录 CSV 下载、一致性校验。
+  网页提供采集状态、震例查询、当前目录 CSV 下载、震级突变记录、一致性校验。
 - **simulator**：源库扰动器，持续对震例表做新增/更正/删除（含一笔事务改多行的
-  “台网重新测定”），模拟目录的持续修订。
+  “台网重新测定”、震级骤变），模拟目录的持续修订。
 
 ## 快速开始
 
@@ -52,6 +55,9 @@ docker compose up --build
 | 未建完则重做且不供数 | 重启时状态为 `loading/catchup`：丢弃半成品重新建立；就绪前查询/CSV 一律 503 |
 | 每次取数只读同一已提交状态 | 每个网页请求只开一个 SQLite 只读事务，计数、取页、整个 CSV 流都在同一快照里 |
 | 只处理行变更 | 仅应用 insert/update/delete；truncate 等记录并忽略 |
+| 震级突变留档 | 续采每笔源事务时比较事务前后镜像中同一震例号的震级，差值绝对值 ≥ 2.0 即记录震例号、旧/新震级、事务 LSN 与源事务号；同一事务内反复更正只按最终值记一次；改回不撤销；初次装载不记；重建后清空只留本轮 |
+| 异常记录与镜像同事务持久化 | `magnitude_anomalies` 与镜像行、`meta.last_applied_lsn` 在同一个 SQLite 事务里提交；失败则一起回滚、不向源库确认；重放同一事务由 `UNIQUE(event_id, lsn)` 去重 |
+| 未就绪不供数（含异常页） | `/events`、`/events.csv`、`/anomalies` 在 `idle/loading/catchup` 时一律 503 |
 
 ## 演示场景
 
@@ -110,6 +116,31 @@ docker compose restart app
 事件日志显示“镜像已就绪，从复制槽的已确认位置续采”——**不重新装载**，
 直接从上次确认位置继续，重启期间的源库变更全部补齐。
 
+### 6. 震级突变留档（供质检复核）
+
+simulator 每隔十余笔事务会制造一次震级骤变（一半概率在**同一笔事务**里先改一版
+再改一版）。镜像就绪后打开状态页的「震级突变记录」
+（<http://localhost:8000/anomalies>），可看到：
+
+- 每行：震例号、旧震级、新震级、差值、事务位置 LSN、源事务号、记录时间；
+- 同一笔事务里反复更正同一震例**只出现一条**，且取事务内最终值；
+- 若之后震级又被改回，先前的记录**不会消失**；
+- 手工制造一次并观察（不需要 simulator）：
+
+```bash
+# 先确认某个震例当前震级，再一次性做出 >= 2.0 的跳变
+docker compose exec db psql -U postgres -d quakes -c \
+  "SELECT event_id, magnitude FROM seismic_events ORDER BY event_id LIMIT 1;"
+docker compose exec db psql -U postgres -d quakes -c \
+  "UPDATE seismic_events SET magnitude=9.5 WHERE event_id='EQH-000001';"
+# 状态页「本轮震级突变记录」+1；打开 /anomalies 查看该笔及事务位置
+```
+
+- **初次装载不记异常**：只有续采（含追平阶段）的源事务会比对前后震级；
+- **重建只查本轮**：点「重新建立镜像」会清空上一轮的突变记录，就绪后只展示本轮；
+- **重启重送不重复记**：异常记录与镜像、续采位置同事务提交，源库重发同一事务时
+  按 `(event_id, lsn)` 去重；写入失败则整笔回滚、不确认源库，重发时补记。
+
 ## 网页与接口
 
 | 路径 | 说明 |
@@ -120,6 +151,7 @@ docker compose restart app
 | `POST /demo/crash-after-save` | 武装“保存后未确认就崩溃”演示 |
 | `GET /events` | 查询震例：震例号前缀、发震时刻区间、最小震级、经纬度范围、分页 |
 | `GET /events.csv` | 下载当前目录 CSV（支持同样筛选；整个文件出自同一已提交状态） |
+| `GET /anomalies` | 本轮震级突变记录（震例号前缀筛选、分页；同一已提交状态） |
 | `GET /verify` | 源库 vs 镜像全量比对（行数 + SHA-256 + 差异样例） |
 | `GET /api/status` | 上述状态的 JSON 版 |
 | `GET /healthz` | 存活探针 |
@@ -140,7 +172,7 @@ docker compose restart app
 | 初始装载中 | 状态 `loading` → 重做装载，就绪前不供数 |
 | 追平中 | 状态 `catchup` → 重做装载（快照已失效，必须重来），就绪前不供数 |
 | 已就绪 | 状态 `done` → 从槽位已确认位置续采，不重新装载 |
-| 保存后未确认就崩溃 | 源库重发未确认事务，镜像幂等重放，不重不漏 |
+| 保存后未确认就崩溃 | 源库重发未确认事务，镜像与突变记录都幂等重放，不重不漏 |
 | 复制槽被删（源库重置） | 自动转为重新建立镜像 |
 | 卷被清空（`down -v`） | 一切从零开始，等待点击「开始建立镜像」 |
 
@@ -160,9 +192,9 @@ compose.yaml            # 一键启动：db + app + simulator
 db/                     # PostgreSQL 16 + wal2json，含 3 万条历史震例的初始化脚本
 app/                    # FastAPI 网页 + 逻辑复制采集线程 + SQLite 镜像
   replicator.py         #   状态机：idle→loading→catchup→done，快照装载与流式续采
-  store.py              #   SQLite 层：数据与续采位置同事务持久化
-  changes.py            #   wal2json 行变更 -> 幂等 upsert/delete
-  main.py               #   网页：状态 / 查询 / CSV / 校验
+  store.py              #   SQLite 层：数据、突变记录与续采位置同事务持久化
+  changes.py            #   wal2json 行变更 -> 幂等 upsert/delete，并识别震级突变
+  main.py               #   网页：状态 / 查询 / CSV / 震级突变记录 / 校验
 simulator/              # 源库扰动器：持续新增/更正/删除
 tests/test_core.py      # 核心逻辑单元测试
 ```

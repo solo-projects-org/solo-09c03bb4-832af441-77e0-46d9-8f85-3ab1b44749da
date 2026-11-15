@@ -4,7 +4,8 @@
   python3 -I tests/test_core.py
 
 覆盖：LSN 换算、时间规范化、wal2json 事务应用的幂等与原子性、
-     读事务快照一致性（每次取数只读同一已提交状态）。
+     读事务快照一致性（每次取数只读同一已提交状态）、
+     震级突变留档（阈值、同事务只记最终值、改回不删、重放不重复、与位置同事务）。
 """
 import os
 import sys
@@ -168,6 +169,94 @@ class SnapshotReadTest(StoreTestBase):
             txn.close()
         self.assertEqual((n1, n2), (1, 1))          # 同一已提交状态
         self.assertEqual(self.store.read("SELECT count(*) FROM events")[0][0], 2)  # 新读见新态
+
+
+class MagnitudeAnomalyTest(StoreTestBase):
+    """震级突变留档：阈值 2.0、每笔事务每震例至多一条、改回也不删、重放不重复。"""
+
+    def apply_txn(self, changes, lsn, xid=None, threshold=2.0):
+        with self.store.write_txn() as cur:
+            counts = apply_transaction(cur, {"change": changes, "xid": xid or lsn},
+                                       lsn=lsn, threshold=threshold)
+            self.store.record_anomalies(cur, counts["anomalies"])
+            Store.set_meta(cur, "last_applied_lsn", lsn)
+            return counts
+
+    def anomalies(self):
+        return self.store.read(
+            "SELECT event_id, old_magnitude, new_magnitude, lsn, source_xid"
+            " FROM magnitude_anomalies ORDER BY id"
+        )
+
+    def test_threshold_is_two_point_zero(self):
+        self.apply({"change": [change("insert", "A", mag=4.5)]}, "0/10")
+        # 差 1.9：不记
+        self.apply_txn([change("update", "A", mag=6.4)], "0/20")
+        self.assertEqual(self.anomalies(), [])
+        # 差 2.0：记
+        self.apply_txn([change("update", "A", mag=8.4)], "0/30")
+        self.assertEqual(self.anomalies(), [("A", 6.4, 8.4, "0/30", "0/30")])
+
+    def test_repeated_correction_in_one_txn_recorded_once_with_final_value(self):
+        self.apply({"change": [change("insert", "A", mag=3.0)]}, "0/10")
+        counts = self.apply_txn(
+            [change("update", "A", mag=6.0),
+             change("update", "A", mag=3.5),
+             change("update", "A", mag=7.5)],
+            "0/20",
+        )
+        self.assertEqual(len(counts["anomalies"]), 1)
+        self.assertEqual(self.anomalies(), [("A", 3.0, 7.5, "0/20", "0/20")])
+
+    def test_reverted_later_keeps_record(self):
+        self.apply({"change": [change("insert", "A", mag=4.0)]}, "0/10")
+        self.apply_txn([change("update", "A", mag=8.0)], "0/20")   # 骤变
+        # 改回本身跨度也 >= 2.0，是另一笔事务的又一次突变，同样留档；
+        # 关键是先前那条记录不被撤销。
+        self.apply_txn([change("update", "A", mag=4.0)], "0/30")
+        self.assertEqual(
+            [a[:4] for a in self.anomalies()],
+            [("A", 4.0, 8.0, "0/20"), ("A", 8.0, 4.0, "0/30")],
+        )
+        self.assertEqual([r[4] for r in self.rows()], [4.0])       # 镜像以最终值为准
+
+    def test_replay_does_not_duplicate(self):
+        self.apply({"change": [change("insert", "A", mag=3.0)]}, "0/10")
+        payload = [change("update", "A", mag=7.2)]
+        self.apply_txn(payload, "0/20")
+        self.apply_txn(payload, "0/20")      # 保存后未确认 -> 源库重发
+        self.assertEqual(len(self.anomalies()), 1)
+
+    def test_new_event_and_delete_do_not_alert(self):
+        self.apply_txn([change("insert", "A", mag=9.0)], "0/10")   # 新震例无“前值”
+        self.apply_txn([change("delete", "A")], "0/20")            # 删除无可比“后值”
+        self.assertEqual(self.anomalies(), [])
+
+    def test_anomaly_and_position_commit_together(self):
+        """写入失败 -> 异常、镜像、位置一并回滚，源库之后重发不会丢记录。"""
+        self.apply({"change": [change("insert", "A", mag=3.0)]}, "0/10")
+        with self.assertRaises(RuntimeError):
+            with self.store.write_txn() as cur:
+                counts = apply_transaction(cur, {"change": [change("update", "A", mag=8.0)]},
+                                           lsn="0/20")
+                self.store.record_anomalies(cur, counts["anomalies"])
+                Store.set_meta(cur, "last_applied_lsn", "0/20")
+                raise RuntimeError("模拟写入失败")
+        self.assertEqual(self.anomalies(), [])
+        self.assertEqual(self.store.get_meta("last_applied_lsn"), "0/10")
+        self.apply_txn([change("update", "A", mag=8.0)], "0/20")   # 重发后补记
+        self.assertEqual(len(self.anomalies()), 1)
+
+    def test_rebuild_clears_previous_round(self):
+        self.apply({"change": [change("insert", "A", mag=3.0)]}, "0/10")
+        self.apply_txn([change("update", "A", mag=8.0)], "0/20")
+        self.assertEqual(len(self.anomalies()), 1)
+        # 与 replicator._reset_for_build 相同的清空动作
+        with self.store.write_txn() as cur:
+            cur.execute("DELETE FROM events")
+            cur.execute("DELETE FROM magnitude_anomalies")
+        self.assertEqual(self.anomalies(), [])
+        self.assertEqual(self.store.count_anomalies(), 0)
 
 
 if __name__ == "__main__":

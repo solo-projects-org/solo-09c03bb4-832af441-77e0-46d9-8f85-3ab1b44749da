@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS event_log (
     ts  TEXT NOT NULL,
     msg TEXT NOT NULL
 );
+
+-- 震级突变审计：续采时同一震例号在一笔源事务前后震级差 >= 2.0 即留档。
+-- 即使之后被改回，本条记录也保留，供复核人员查阅。
+-- UNIQUE(event_id, lsn)：源库重发未确认事务时幂等，不重复记。
+CREATE TABLE IF NOT EXISTS magnitude_anomalies (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id      TEXT NOT NULL,
+    old_magnitude REAL NOT NULL,
+    new_magnitude REAL NOT NULL,
+    lsn           TEXT NOT NULL,      -- 事务位置（wal2json 消息 data_start）
+    source_xid    TEXT,               -- 源事务号（便于复核）
+    detected_at   TEXT NOT NULL,
+    UNIQUE(event_id, lsn)
+);
+CREATE INDEX IF NOT EXISTS magnitude_anomalies_event_idx
+    ON magnitude_anomalies(event_id);
 """
 
 LOG_KEEP = 100
@@ -114,4 +130,33 @@ class Store:
     def recent_log(self, limit=20):
         return self.read(
             "SELECT ts, msg FROM event_log ORDER BY id DESC LIMIT ?", (limit,)
+        )
+
+    # ---------- 震级突变记录 ----------
+    def record_anomalies(self, cur, anomalies):
+        """在调用方的写事务里落库震级突变；重放同一事务时静默去重。"""
+        for a in anomalies:
+            cur.execute(
+                "INSERT INTO magnitude_anomalies"
+                "(event_id, old_magnitude, new_magnitude, lsn, source_xid, detected_at)"
+                " VALUES(?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(event_id, lsn) DO NOTHING",
+                (
+                    a["event_id"],
+                    a["old_magnitude"],
+                    a["new_magnitude"],
+                    a["lsn"],
+                    a["xid"],
+                    utcnow(),
+                ),
+            )
+
+    def count_anomalies(self):
+        return self.read("SELECT count(*) FROM magnitude_anomalies")[0][0]
+
+    def recent_anomalies(self, limit=200):
+        return self.read(
+            "SELECT event_id, old_magnitude, new_magnitude, lsn, source_xid, detected_at"
+            " FROM magnitude_anomalies ORDER BY id DESC LIMIT ?",
+            (limit,),
         )
